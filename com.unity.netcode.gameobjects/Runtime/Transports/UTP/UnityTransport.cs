@@ -19,6 +19,7 @@ using Unity.Networking.Transport.Relay;
 using Unity.Networking.Transport.Utilities;
 #if UTP_TRANSPORT_2_0_ABOVE
 using Unity.Networking.Transport.TLS;
+using System.Collections;
 #endif
 
 #if !UTP_TRANSPORT_2_0_ABOVE
@@ -43,6 +44,7 @@ namespace Unity.Netcode.Transports.UTP
         void CreateDriver(
             UnityTransport transport,
             out NetworkDriver driver,
+            out NetworkDriver driver2,
             out NetworkPipeline unreliableFragmentedPipeline,
             out NetworkPipeline unreliableSequencedFragmentedPipeline,
             out NetworkPipeline reliableSequencedPipeline);
@@ -187,6 +189,15 @@ namespace Unity.Netcode.Transports.UTP
         {
             get => m_UseEncryption;
             set => m_UseEncryption = value;
+        }
+
+        [Tooltip("Only set to true when hosting. This will cause the host to use websockets and udp")]
+        [SerializeField]
+        private bool m_UseMultiDrivers = false;
+
+        public bool UseMultiDrivers {
+            get => m_UseMultiDrivers;
+            set => m_UseMultiDrivers = value;
         }
 #endif
 
@@ -430,8 +441,10 @@ namespace Unity.Netcode.Transports.UTP
 
         private State m_State = State.Disconnected;
         private NetworkDriver m_Driver;
+        private NetworkDriver m_Driver2;
         private NetworkSettings m_NetworkSettings;
         private ulong m_ServerClientId;
+        private MultiNetworkDriver m_multiDriver;
 
         private NetworkPipeline m_UnreliableFragmentedPipeline;
         private NetworkPipeline m_UnreliableSequencedFragmentedPipeline;
@@ -468,6 +481,7 @@ namespace Unity.Netcode.Transports.UTP
             DriverConstructor.CreateDriver(
                 this,
                 out m_Driver,
+                out m_Driver2,
                 out m_UnreliableFragmentedPipeline,
                 out m_UnreliableSequencedFragmentedPipeline,
                 out m_ReliableSequencedPipeline);
@@ -480,6 +494,14 @@ namespace Unity.Netcode.Transports.UTP
             if (m_Driver.IsCreated)
             {
                 m_Driver.Dispose();
+            }
+            if (m_Driver2.IsCreated) 
+            {
+                m_Driver2.Dispose();
+            }
+            if (m_multiDriver.IsCreated) 
+            {
+                m_multiDriver.Dispose();
             }
 
             m_NetworkSettings.Dispose();
@@ -579,10 +601,27 @@ namespace Unity.Netcode.Transports.UTP
             }
 
             result = m_Driver.Listen();
-            if (result != 0)
-            {
+            if (result != 0) {
                 Debug.LogError("Server failed to listen.");
                 return false;
+            }
+
+            if (m_UseMultiDrivers) {
+                result = m_Driver2.Bind(endPoint.WithPort((ushort)(endPoint.Port + 1)));
+                if (result != 0) {
+                    Debug.LogError("m_Driver2: Server failed to bind. This is usually caused by another process being bound to the same port.");
+                    return false;
+                }
+
+                result = m_Driver2.Listen();
+                if (result != 0) {
+                    Debug.LogError("m_Driver2: Server failed to listen.");
+                    return false;
+                }
+
+                m_multiDriver = MultiNetworkDriver.Create();
+                m_multiDriver.AddDriver(m_Driver);
+                m_multiDriver.AddDriver(m_Driver2);
             }
 
             m_State = State.Listening;
@@ -780,34 +819,99 @@ namespace Unity.Netcode.Transports.UTP
             }
         }
 
+        [BurstCompile]
+        private struct SendMultiBatchedMessagesJob : IJob
+        {
+            public MultiNetworkDriver.Concurrent Driver;
+            public SendTarget Target;
+            public BatchedSendQueue Queue;
+            public NetworkPipeline ReliablePipeline;
+            public int MTU;
+
+            public void Execute()
+            {
+                var clientId = Target.ClientId;
+                var connection = ParseClientId(clientId);
+                var pipeline = Target.NetworkPipeline;
+
+                while (!Queue.IsEmpty) {
+                    var result = Driver.BeginSend(pipeline, connection, out var writer);
+                    if (result != (int)Networking.Transport.Error.StatusCode.Success) {
+                        Debug.LogError($"Error sending message: {ErrorUtilities.ErrorToFixedString(result, clientId)}");
+                        return;
+                    }
+
+                    // We don't attempt to send entire payloads over the reliable pipeline. Instead we
+                    // fragment it manually. This is safe and easy to do since the reliable pipeline
+                    // basically implements a stream, so as long as we separate the different messages
+                    // in the stream (the send queue does that automatically) we are sure they'll be
+                    // reassembled properly at the other end. This allows us to lift the limit of ~44KB
+                    // on reliable payloads (because of the reliable window size).
+                    var written = pipeline == ReliablePipeline ? Queue.FillWriterWithBytes(ref writer, MTU) : Queue.FillWriterWithMessages(ref writer);
+
+                    result = Driver.EndSend(writer);
+                    if (result == written) {
+                        // Batched message was sent successfully. Remove it from the queue.
+                        Queue.Consume(written);
+                    }
+                    else {
+                        // Some error occured. If it's just the UTP queue being full, then don't log
+                        // anything since that's okay (the unsent message(s) are still in the queue
+                        // and we'll retry sending them later). Otherwise log the error and remove the
+                        // message from the queue (we don't want to resend it again since we'll likely
+                        // just get the same error again).
+                        if (result != (int)Networking.Transport.Error.StatusCode.NetworkSendQueueFull) {
+                            Debug.LogError($"Error sending the message: {ErrorUtilities.ErrorToFixedString(result, clientId)}");
+                            Queue.Consume(written);
+                        }
+
+                        return;
+                    }
+                }
+            }
+        }
+
         // Send as many batched messages from the queue as possible.
         private void SendBatchedMessages(SendTarget sendTarget, BatchedSendQueue queue)
         {
-            if (!m_Driver.IsCreated)
-            {
+            if (!m_Driver.IsCreated) {
                 return;
             }
 
             var mtu = 0;
-            if (NetworkManager)
-            {
+            if (NetworkManager) {
                 var ngoClientId = NetworkManager.ConnectionManager.TransportIdToClientId(sendTarget.ClientId);
                 mtu = NetworkManager.GetPeerMTU(ngoClientId);
             }
 
-            new SendBatchedMessagesJob
-            {
-                Driver = m_Driver.ToConcurrent(),
-                Target = sendTarget,
-                Queue = queue,
-                ReliablePipeline = m_ReliableSequencedPipeline,
-                MTU = mtu,
-            }.Run();
+            if (m_UseMultiDrivers) {
+                new SendMultiBatchedMessagesJob {
+                    Driver = m_multiDriver.ToConcurrent(),
+                    Target = sendTarget,
+                    Queue = queue,
+                    ReliablePipeline = m_ReliableSequencedPipeline,
+                    MTU = mtu,
+                }.Run();
+            } else {
+                new SendBatchedMessagesJob {
+                    Driver = m_Driver.ToConcurrent(),
+                    Target = sendTarget,
+                    Queue = queue,
+                    ReliablePipeline = m_ReliableSequencedPipeline,
+                    MTU = mtu,
+                }.Run();
+            }
         }
 
         private bool AcceptConnection()
         {
-            var connection = m_Driver.Accept();
+            NetworkConnection connection;
+
+            if (m_UseMultiDrivers) {
+                connection = m_multiDriver.Accept();
+            } else {
+                connection = m_Driver.Accept();
+            }
 
             if (connection == default)
             {
@@ -858,7 +962,15 @@ namespace Unity.Netcode.Transports.UTP
 
         private bool ProcessEvent()
         {
-            var eventType = m_Driver.PopEvent(out var networkConnection, out var reader, out var pipeline);
+            TransportNetworkEvent.Type eventType;
+            NetworkConnection networkConnection;
+            DataStreamReader reader;
+            NetworkPipeline pipeline;
+            if (m_UseMultiDrivers) {
+                eventType = m_multiDriver.PopEvent(out networkConnection, out reader, out pipeline);
+            } else {
+                eventType = m_Driver.PopEvent(out networkConnection, out reader, out pipeline);
+            }
             var clientId = ParseClientId(networkConnection);
 
             switch (eventType)
@@ -912,14 +1024,14 @@ namespace Unity.Netcode.Transports.UTP
 
         private void Update()
         {
-            if (m_Driver.IsCreated)
+            if (m_multiDriver.IsCreated)
             {
                 foreach (var kvp in m_SendQueue)
                 {
                     SendBatchedMessages(kvp.Key, kvp.Value);
                 }
 
-                m_Driver.ScheduleUpdate().Complete();
+                m_multiDriver.ScheduleUpdate().Complete();
 
                 if (m_ProtocolType == ProtocolType.RelayUnityTransport && m_Driver.GetRelayConnectionStatus() == RelayConnectionStatus.AllocationInvalid)
                 {
@@ -1170,9 +1282,14 @@ namespace Unity.Netcode.Transports.UTP
                 ClearSendQueuesForClientId(clientId);
 
                 var connection = ParseClientId(clientId);
-                if (m_Driver.GetConnectionState(connection) != NetworkConnection.State.Disconnected)
-                {
-                    m_Driver.Disconnect(connection);
+                if (m_UseMultiDrivers) {
+                    if (m_multiDriver.GetConnectionState(connection) != NetworkConnection.State.Disconnected) {
+                        m_multiDriver.Disconnect(connection);
+                    }
+                } else {
+                    if (m_Driver.GetConnectionState(connection) != NetworkConnection.State.Disconnected) {
+                        m_Driver.Disconnect(connection);
+                    }
                 }
             }
         }
@@ -1325,7 +1442,11 @@ namespace Unity.Netcode.Transports.UTP
                     // to make space in the send queue. This is an expensive operation, but a user
                     // would need to send A LOT of unreliable traffic in one update to get here.
 
-                    m_Driver.ScheduleFlushSend(default).Complete();
+                    if (m_UseMultiDrivers) {
+                        m_multiDriver.ScheduleFlushSend(default).Complete();
+                    } else {
+                        m_Driver.ScheduleFlushSend(default).Complete();
+                    }
                     SendBatchedMessages(sendTarget, queue);
 
                     // Don't check for failure. If it still doesn't work, there's nothing we can do
@@ -1378,14 +1499,20 @@ namespace Unity.Netcode.Transports.UTP
             {
                 case ProtocolType.UnityTransport:
                     succeeded = ServerBindAndListen(ConnectionData.ListenEndPoint);
-                    if (!succeeded && m_Driver.IsCreated)
+                    if (!succeeded && m_multiDriver.IsCreated) {
+                        m_multiDriver.Dispose();
+                    }
+                    else if (!succeeded && m_Driver.IsCreated)
                     {
                         m_Driver.Dispose();
                     }
                     return succeeded;
                 case ProtocolType.RelayUnityTransport:
                     succeeded = StartRelayServer();
-                    if (!succeeded && m_Driver.IsCreated)
+                    if (!succeeded && m_multiDriver.IsCreated) {
+                        m_multiDriver.Dispose();
+                    }
+                    else if (!succeeded && m_Driver.IsCreated)
                     {
                         m_Driver.Dispose();
                     }
@@ -1400,13 +1527,24 @@ namespace Unity.Netcode.Transports.UTP
         /// </summary>
         public override void Shutdown()
         {
-            if (m_Driver.IsCreated)
-            {
+            if (m_multiDriver.IsCreated) {
                 // Flush all send queues to the network. NGO can be configured to flush its message
                 // queue on shutdown. But this only calls the Send() method, which doesn't actually
                 // get anything to the network.
-                foreach (var kvp in m_SendQueue)
-                {
+                foreach (var kvp in m_SendQueue) {
+                    SendBatchedMessages(kvp.Key, kvp.Value);
+                }
+
+                // The above flush only puts the message in UTP internal buffers, need an update to
+                // actually get the messages on the wire. (Normally a flush send would be sufficient,
+                // but there might be disconnect messages and those require an update call.)
+                m_multiDriver.ScheduleUpdate().Complete();
+            }
+            else if (m_Driver.IsCreated) {
+                // Flush all send queues to the network. NGO can be configured to flush its message
+                // queue on shutdown. But this only calls the Send() method, which doesn't actually
+                // get anything to the network.
+                foreach (var kvp in m_SendQueue) {
                     SendBatchedMessages(kvp.Key, kvp.Value);
                 }
 
@@ -1502,7 +1640,7 @@ namespace Unity.Netcode.Transports.UTP
         /// <param name="unreliableFragmentedPipeline">The UnreliableFragmented NetworkPipeline</param>
         /// <param name="unreliableSequencedFragmentedPipeline">The UnreliableSequencedFragmented NetworkPipeline</param>
         /// <param name="reliableSequencedPipeline">The ReliableSequenced NetworkPipeline</param>
-        public void CreateDriver(UnityTransport transport, out NetworkDriver driver,
+        public void CreateDriver(UnityTransport transport, out NetworkDriver driver, out NetworkDriver driver2,
             out NetworkPipeline unreliableFragmentedPipeline,
             out NetworkPipeline unreliableSequencedFragmentedPipeline,
             out NetworkPipeline reliableSequencedPipeline)
@@ -1594,9 +1732,15 @@ namespace Unity.Netcode.Transports.UTP
 #endif
 
 #if UTP_TRANSPORT_2_0_ABOVE
-            if (m_UseWebSockets)
+            if (m_UseMultiDrivers) 
             {
                 driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
+                driver2 = NetworkDriver.Create(new UDPNetworkInterface(), m_NetworkSettings);
+            }
+            else if (m_UseWebSockets)
+            {
+                driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
+                driver2 = driver;
             }
             else
             {
@@ -1605,6 +1749,7 @@ namespace Unity.Netcode.Transports.UTP
                 driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
 #else
                 driver = NetworkDriver.Create(new UDPNetworkInterface(), m_NetworkSettings);
+                driver2 = driver;
 #endif
             }
 #else
@@ -1625,6 +1770,12 @@ namespace Unity.Netcode.Transports.UTP
                 out unreliableFragmentedPipeline,
                 out unreliableSequencedFragmentedPipeline,
                 out reliableSequencedPipeline);
+            if (m_UseMultiDrivers) {
+                SetupPipelinesForUtp2(driver2,
+                out unreliableFragmentedPipeline,
+                out unreliableSequencedFragmentedPipeline,
+                out reliableSequencedPipeline);
+            }
 #endif
         }
 
