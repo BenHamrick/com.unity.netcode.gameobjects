@@ -1671,7 +1671,7 @@ namespace Unity.Netcode.Transports.UTP
                 throw new Exception("WebGL as a server is not supported by Unity Transport, outside the Editor.");
             }
 #endif
-
+            var unsecureNetworkSettings = m_NetworkSettings;
 #if UTP_TRANSPORT_2_0_ABOVE
             if (m_UseEncryption)
             {
@@ -1735,7 +1735,7 @@ namespace Unity.Netcode.Transports.UTP
             if (m_UseMultiDrivers) 
             {
                 driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
-                driver2 = NetworkDriver.Create(new UDPNetworkInterface(), m_NetworkSettings);
+                driver2 = NetworkDriver.Create(new UDPNetworkInterface(), unsecureNetworkSettings);
             }
             else if (m_UseWebSockets)
             {
