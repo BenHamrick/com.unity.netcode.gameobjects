@@ -1729,8 +1729,8 @@ namespace Unity.Netcode.Transports.UTP
 #if UTP_TRANSPORT_2_0_ABOVE
             if (m_UseMultiDrivers) 
             {
-                driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
-                driver2 = NetworkDriver.Create(new UDPNetworkInterface(), unsecureNetworkSettings);
+                driver2 = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
+                driver = NetworkDriver.Create(new UDPNetworkInterface(), unsecureNetworkSettings);
             }
             else if (m_UseWebSockets)
             {
