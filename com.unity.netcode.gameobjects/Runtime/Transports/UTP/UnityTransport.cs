@@ -491,17 +491,12 @@ namespace Unity.Netcode.Transports.UTP
 
         private void DisposeInternals()
         {
-            if (m_Driver.IsCreated)
+            if (m_multiDriver.IsCreated) {
+                m_multiDriver.Dispose();
+            }
+            else if (m_Driver.IsCreated)
             {
                 m_Driver.Dispose();
-            }
-            if (m_Driver2.IsCreated) 
-            {
-                m_Driver2.Dispose();
-            }
-            if (m_multiDriver.IsCreated) 
-            {
-                m_multiDriver.Dispose();
             }
 
             m_NetworkSettings.Dispose();
@@ -607,7 +602,7 @@ namespace Unity.Netcode.Transports.UTP
             }
 
             if (m_UseMultiDrivers) {
-                result = m_Driver2.Bind(endPoint.WithPort((ushort)(endPoint.Port + 1)));
+                result = m_Driver2.Bind(endPoint);
                 if (result != 0) {
                     Debug.LogError("m_Driver2: Server failed to bind. This is usually caused by another process being bound to the same port.");
                     return false;
