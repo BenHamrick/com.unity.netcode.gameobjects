@@ -1618,8 +1618,8 @@ namespace Unity.Netcode.Transports.UTP
             else
             {
 #if UNITY_WEBGL && !UNITY_EDITOR
-                Debug.LogWarning($"WebSockets were used even though they're not selected in NetworkManager. You should check {nameof(UseWebSockets)}', on the Unity Transport component, to silence this warning.");
-                driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
+                Debug.LogWarning($"We are on WebGL so IPCNetworkInterface were used to allow single player mode.");
+                driver = NetworkDriver.Create(new IPCNetworkInterface(), m_NetworkSettings);
 #else
                 driver = NetworkDriver.Create(new UDPNetworkInterface(), m_NetworkSettings);
 #endif
