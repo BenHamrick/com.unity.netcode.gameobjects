@@ -177,6 +177,16 @@ namespace Unity.Netcode.Transports.UTP
             set => m_UseWebSockets = value;
         }
 
+        [Tooltip("Per default the client/server will communicate over UDP. Set to true to communicate locally using IPC.")]
+        [SerializeField]
+        private bool m_UseIPC = false;
+
+        public bool UseIPC
+        {
+            get => m_UseIPC;
+            set => m_UseIPC = value;
+        }
+
         /// <summary>
         /// Per default the client/server communication will not be encrypted. Select true to enable DTLS for UDP and TLS for Websocket.
         /// </summary>
@@ -202,11 +212,12 @@ namespace Unity.Netcode.Transports.UTP
             set => m_MaxPacketQueueSize = value;
         }
 
-        [Tooltip("The maximum size of an unreliable payload that can be handled by the transport.")]
+        [Tooltip("The maximum size of an unreliable payload that can be handled by the transport. The memory for MaxPayloadSize is allocated once per connection and is released when the connection is closed.")]
         [SerializeField]
         private int m_MaxPayloadSize = InitialMaxPayloadSize;
 
         /// <summary>The maximum size of an unreliable payload that can be handled by the transport.</summary>
+        /// <remarks>The memory for MaxPayloadSize is allocated once per connection and is released when the connection is closed.</remarks>
         public int MaxPayloadSize
         {
             get => m_MaxPayloadSize;
@@ -1543,13 +1554,12 @@ namespace Unity.Netcode.Transports.UTP
 #endif
                 heartbeatTimeoutMS: transport.m_HeartbeatTimeoutMS);
 
-// We want to use host as a way to do single player without a server so we can ignore this exception
-// #if UNITY_WEBGL && !UNITY_EDITOR
-//             if (NetworkManager.IsServer && m_ProtocolType != ProtocolType.RelayUnityTransport)
-//             {
-//                 throw new Exception("WebGL as a server is not supported by Unity Transport, outside the Editor.");
-//             }
-// #endif
+#if UNITY_WEBGL && !UNITY_EDITOR
+            if (NetworkManager.IsServer && m_ProtocolType != ProtocolType.RelayUnityTransport && m_UseIPC == false)
+            {
+                throw new Exception("WebGL as a server is not supported by Unity Transport, outside the Editor. Use IPC or Relay instead.");
+            }
+#endif
 
 #if UTP_TRANSPORT_2_0_ABOVE
             if (m_UseEncryption)
@@ -1611,15 +1621,19 @@ namespace Unity.Netcode.Transports.UTP
 #endif
 
 #if UTP_TRANSPORT_2_0_ABOVE
-            if (m_UseWebSockets)
+            if (m_UseIPC)
+            {
+                driver = NetworkDriver.Create(new IPCNetworkInterface(), m_NetworkSettings);
+            }
+            else if (m_UseWebSockets)
             {
                 driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
             }
             else
             {
 #if UNITY_WEBGL && !UNITY_EDITOR
-                Debug.LogWarning($"We are on WebGL so IPCNetworkInterface were used to allow single player mode.");
-                driver = NetworkDriver.Create(new IPCNetworkInterface(), m_NetworkSettings);
+                Debug.LogWarning($"WebSockets were used even though they're not selected in NetworkManager. You should check {nameof(UseWebSockets)}', on the Unity Transport component, to silence this warning.");
+                driver = NetworkDriver.Create(new WebSocketNetworkInterface(), m_NetworkSettings);
 #else
                 driver = NetworkDriver.Create(new UDPNetworkInterface(), m_NetworkSettings);
 #endif
