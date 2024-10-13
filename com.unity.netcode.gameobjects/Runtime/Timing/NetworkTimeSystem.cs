@@ -38,9 +38,13 @@ namespace Unity.Netcode
 
         private double m_TimeSec;
         private double m_CurrentLocalTimeOffset;
-        private double m_DesiredLocalTimeOffset;
+        private double[] m_DesiredLocalTimeOffsets = new double[8];
+        private double[] m_DesiredLocalTimeOffsetsSorted = new double[8];
+        private int m_DesiredLocalTimeOffsetIndex = 0;
         private double m_CurrentServerTimeOffset;
-        private double m_DesiredServerTimeOffset;
+        private double[] m_DesiredServerTimeOffsets = new double[8];
+        private double[] m_DesiredServerTimeOffsetsSorted = new double[8];
+        private int m_DesiredServerTimeOffsetIndex = 0;
 
         /// <summary>
         /// Gets or sets the amount of time in seconds the server should buffer incoming client messages.
@@ -140,10 +144,6 @@ namespace Unity.Netcode
 
             m_NetworkTickSystem.UpdateTick(LocalTime, ServerTime);
 
-            if (!m_ConnectionManager.LocalClient.IsServer)
-            {
-                Sync(LastSyncedServerTimeSec + m_NetworkManager.RealTimeProvider.UnscaledDeltaTime, m_NetworkTransport.GetCurrentRtt(NetworkManager.ServerClientId) / 1000d);
-            }
         }
 
         /// <summary>
@@ -165,7 +165,7 @@ namespace Unity.Netcode
             {
                 var message = new TimeSyncMessage
                 {
-                    Tick = m_NetworkTickSystem.ServerTime.Tick
+                    Time = m_NetworkTickSystem.ServerTime.Time
                 };
                 m_ConnectionManager.SendMessage(ref message, NetworkDelivery.Unreliable, m_ConnectionManager.ConnectedClientIds);
             }
@@ -205,22 +205,6 @@ namespace Unity.Netcode
         {
             m_TimeSec += deltaTimeSec;
 
-            if (Math.Abs(m_DesiredLocalTimeOffset - m_CurrentLocalTimeOffset) > HardResetThresholdSec || Math.Abs(m_DesiredServerTimeOffset - m_CurrentServerTimeOffset) > HardResetThresholdSec)
-            {
-                m_TimeSec += m_DesiredServerTimeOffset;
-
-                m_DesiredLocalTimeOffset -= m_DesiredServerTimeOffset;
-                m_CurrentLocalTimeOffset = m_DesiredLocalTimeOffset;
-
-                m_DesiredServerTimeOffset = 0;
-                m_CurrentServerTimeOffset = 0;
-
-                return true;
-            }
-
-            m_CurrentLocalTimeOffset += deltaTimeSec * (m_DesiredLocalTimeOffset > m_CurrentLocalTimeOffset ? AdjustmentRatio : -AdjustmentRatio);
-            m_CurrentServerTimeOffset += deltaTimeSec * (m_DesiredServerTimeOffset > m_CurrentServerTimeOffset ? AdjustmentRatio : -AdjustmentRatio);
-
             return false;
         }
 
@@ -247,8 +231,42 @@ namespace Unity.Netcode
 
             var timeDif = serverTimeSec - m_TimeSec;
 
-            m_DesiredServerTimeOffset = timeDif - ServerBufferSec;
-            m_DesiredLocalTimeOffset = timeDif + (rttSec * 0.5d) + LocalBufferSec;
+            var desiredServerTimeOffsetIndex = m_DesiredServerTimeOffsetIndex;
+            var desiredLocalTimeOffsetIndex = m_DesiredLocalTimeOffsetIndex;
+            m_DesiredServerTimeOffsets[desiredServerTimeOffsetIndex] = timeDif - ServerBufferSec;
+            m_DesiredServerTimeOffsetIndex = (m_DesiredServerTimeOffsetIndex + 1) % m_DesiredServerTimeOffsets.Length;
+            m_DesiredLocalTimeOffsets[desiredLocalTimeOffsetIndex] = timeDif + (rttSec * 0.5d) + LocalBufferSec;
+            m_DesiredLocalTimeOffsetIndex = (m_DesiredLocalTimeOffsetIndex + 1) % m_DesiredLocalTimeOffsets.Length;
+
+            for (var i = 0; i < m_DesiredServerTimeOffsets.Length; i++) {
+                if (m_DesiredServerTimeOffsets[i] == 0.0d) {
+                    m_CurrentServerTimeOffset =  m_DesiredServerTimeOffsets[desiredServerTimeOffsetIndex];
+                    m_CurrentLocalTimeOffset = m_DesiredLocalTimeOffsets[desiredLocalTimeOffsetIndex];
+                    return;
+                }
+            } 
+
+            Array.Copy(m_DesiredServerTimeOffsets, m_DesiredServerTimeOffsetsSorted, m_DesiredServerTimeOffsets.Length);
+            Array.Sort(m_DesiredServerTimeOffsetsSorted);
+            Array.Copy(m_DesiredLocalTimeOffsets, m_DesiredLocalTimeOffsetsSorted, m_DesiredLocalTimeOffsets.Length);
+            Array.Sort(m_DesiredLocalTimeOffsetsSorted);
+
+            double serverTimeOffset = m_DesiredServerTimeOffsetsSorted[m_DesiredServerTimeOffsetsSorted.Length / 2];
+            double localTimeOffset = m_DesiredLocalTimeOffsetsSorted[m_DesiredLocalTimeOffsetsSorted.Length / 2];
+            bool didChange = false;
+            if (Math.Abs(m_CurrentServerTimeOffset - serverTimeOffset) > 0.01d) {
+                m_CurrentServerTimeOffset = serverTimeOffset;
+                didChange = true;
+                UnityEngine.Debug.Log($"DesiredServerTimeOffset={m_CurrentServerTimeOffset}");
+            }
+            if (Math.Abs(m_CurrentLocalTimeOffset - localTimeOffset) > 0.01d) {
+                m_CurrentLocalTimeOffset = localTimeOffset;
+                didChange = true;
+                UnityEngine.Debug.Log($"DesiredLocalTimeOffset={m_CurrentLocalTimeOffset}");
+            }
+            if (didChange) {
+                m_NetworkTickSystem.Reset(LocalTime, ServerTime);
+            }
         }
     }
 }
